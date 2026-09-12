@@ -121,6 +121,22 @@ type ClaudeHeaderDefaults struct {
 	Timeout                string `yaml:"timeout" json:"timeout"`
 	Timezone               string `yaml:"timezone" json:"timezone"`
 	StabilizeDeviceProfile *bool  `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
+
+	// TrustClientVersion is a LOCAL PATCH (not upstream). When true, a request
+	// whose User-Agent is a well-formed native Claude Code UA is judged
+	// plausible on shape alone, without comparing its version to the measured
+	// baseline above.
+	//
+	// The baseline is a fixed string in the binary. A real Claude Code that
+	// self-updates past it silently stops being recognized as native and gets
+	// cloaked instead -- the deployment starts forging requests with no signal
+	// that anything changed. Where the operator knows every caller is a genuine
+	// client (single trusted client, network-restricted, keyed), pinning to a
+	// version that the client will inevitably leave behind buys nothing and
+	// costs exactly the surprise it was meant to prevent.
+	//
+	// Default nil/false preserves upstream behavior.
+	TrustClientVersion *bool `yaml:"trust-client-version,omitempty" json:"trust-client-version,omitempty"`
 }
 
 // CodexHeaderDefaults configures fallback header values injected into Codex

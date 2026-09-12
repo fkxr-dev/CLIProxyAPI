@@ -63,9 +63,19 @@ var claudeCodeSubclientByEntrypoint = map[string]string{
 // Only product surfaces with verified 2.1.220 wire behavior are eligible for
 // pass-through. Other first-party-looking entrypoints are cloaked until their
 // CPA-reachable request shape has been captured and reviewed.
+//
+// LOCAL PATCH (not upstream): sdk-ts added. This deployment fronts one client,
+// t3 code, which is Claude Code on the TypeScript Agent SDK, against the
+// operator's own OAuth subscription. Its wire shape was captured here with
+// request-log and reviewed, which is the condition the comment above names.
+// Cloaking it would send Anthropic a fabricated "(external, cli)" 2.1.220
+// request in place of the real one; pass-through keeps the caller's own
+// User-Agent, beta list and session id, so back-end behavior is whatever the
+// unproxied client would have got. Revisit on rebase.
 var nativeClaudeEntrypoints = map[string]bool{
 	"cli":           true,
 	"sdk-cli":       true,
+	"sdk-ts":        true,
 	"claude-vscode": true,
 }
 
@@ -123,8 +133,8 @@ type ClaudeCodeRequestDetection struct {
 // applies CPA's native-client policy. Standard Messages requests require all
 // four strong signals; count_tokens omits metadata.user_id. A separate narrow
 // profile recognizes measured native Haiku helper requests that intentionally
-// omit claude-code-20250219. Generic sdk-ts/sdk-py Agent SDK entrypoints remain
-// unconfirmed and receive CLI cloaking.
+// omit claude-code-20250219. The sdk-ts entrypoint is accepted by this fork;
+// sdk-py remains unconfirmed and receives CLI cloaking.
 func DetectClaudeCodeRequest(headers http.Header, payload []byte, countTokens bool, configs ...*config.Config) ClaudeCodeRequestDetection {
 	var cfg *config.Config
 	if len(configs) > 0 {
@@ -471,8 +481,18 @@ func plausibleClaudeCodeUserAgent(userAgent string, cfg *config.Config) bool {
 		return false
 	}
 	candidate, okCandidate := parseClaudeCLIVersion(userAgent)
+	if !okCandidate {
+		return false
+	}
+	// LOCAL PATCH (not upstream): see ClaudeHeaderDefaults.TrustClientVersion.
+	// The UA still has to be a well-formed native Claude Code UA to get here;
+	// this only drops the comparison against the binary's pinned baseline, so a
+	// client that updates itself does not silently fall back to being cloaked.
+	if cfg != nil && cfg.ClaudeHeaderDefaults.TrustClientVersion != nil && *cfg.ClaudeHeaderDefaults.TrustClientVersion {
+		return true
+	}
 	baseline, okBaseline := parseClaudeCLIVersion(defaultClaudeDeviceProfile(cfg).UserAgent)
-	return okCandidate && okBaseline && plausibleClaudeCLIVersion(candidate, baseline)
+	return okBaseline && plausibleClaudeCLIVersion(candidate, baseline)
 }
 
 func parseClaudeCodeUserAgentDetails(userAgent string) (entrypoint, agentSDKVersion string) {

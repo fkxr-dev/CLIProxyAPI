@@ -128,7 +128,7 @@ func TestDetectClaudeCodeRequestClassifiesEntrypoints(t *testing.T) {
 		{name: "cli", userAgent: "claude-cli/2.1.258 (external, cli)", entrypoint: "cli", subclient: "claude-code-cli", native: true},
 		{name: "vscode-agent-sdk", userAgent: "claude-cli/2.1.258 (external, claude-vscode, agent-sdk/0.3.220)", entrypoint: "claude-vscode", subclient: "claude-code-vscode", agentSDKVersion: "0.3.220", native: true},
 		{name: "sdk-cli", userAgent: "claude-cli/2.1.258 (external, sdk-cli)", entrypoint: "sdk-cli", subclient: "claude-code-cli-sdk", native: true},
-		{name: "sdk-ts", userAgent: "claude-cli/2.1.258 (external, sdk-ts, agent-sdk/0.3.220)", entrypoint: "sdk-ts", subclient: "claude-code-sdk-ts", agentSDKVersion: "0.3.220"},
+		{name: "sdk-ts", userAgent: "claude-cli/2.1.258 (external, sdk-ts, agent-sdk/0.3.220)", entrypoint: "sdk-ts", subclient: "claude-code-sdk-ts", agentSDKVersion: "0.3.220", native: true},
 		{name: "sdk-py", userAgent: "claude-cli/2.1.258 (external, sdk-py, agent-sdk/0.1.0)", entrypoint: "sdk-py", subclient: "claude-code-sdk-py", agentSDKVersion: "0.1.0"},
 		{name: "desktop", userAgent: "claude-cli/2.1.258 (external, claude-desktop)", entrypoint: "claude-desktop", subclient: "claude-desktop"},
 		{name: "desktop-third-party-inference", userAgent: "claude-cli/2.1.258 (external, claude-desktop-3p)", entrypoint: "claude-desktop-3p", subclient: "claude-desktop-3p"},
@@ -518,4 +518,53 @@ func TestMeasuredHelperProfileIgnoresConfiguredStainlessTimeout(t *testing.T) {
 			t.Fatalf("detection = %#v, want a non-measured timeout to disqualify the helper profile", detection)
 		}
 	})
+}
+
+func TestPlausibleClaudeCodeUserAgentTrustClientVersion(t *testing.T) {
+	enabled, disabled := true, false
+	for _, test := range []struct {
+		name      string
+		cfg       *config.Config
+		userAgent string
+		want      bool
+	}{
+		{name: "nil config rejects future version", userAgent: "claude-cli/9.9.9 (external, sdk-ts, agent-sdk/9.9.9)"},
+		{name: "unset rejects future version", cfg: &config.Config{}, userAgent: "claude-cli/9.9.9 (external, sdk-ts, agent-sdk/9.9.9)"},
+		{name: "disabled rejects future version", cfg: &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{TrustClientVersion: &disabled}}, userAgent: "claude-cli/9.9.9 (external, sdk-ts, agent-sdk/9.9.9)"},
+		{name: "enabled accepts future version", cfg: &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{TrustClientVersion: &enabled}}, userAgent: "claude-cli/9.9.9 (external, sdk-ts, agent-sdk/9.9.9)", want: true},
+		{name: "enabled rejects foreign client", cfg: &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{TrustClientVersion: &enabled}}, userAgent: "curl/9.9.9"},
+		{name: "enabled rejects malformed version", cfg: &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{TrustClientVersion: &enabled}}, userAgent: "claude-cli/invalid (external, sdk-ts, agent-sdk/9.9.9)"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := plausibleClaudeCodeUserAgent(test.userAgent, test.cfg); got != test.want {
+				t.Fatalf("plausibleClaudeCodeUserAgent() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDetectClaudeCodeRequestTrustClientVersionKeepsOtherSignals(t *testing.T) {
+	enabled := true
+	cfg := &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{TrustClientVersion: &enabled}}
+	for _, test := range []struct {
+		name, entrypoint string
+		missingBeta      bool
+		want             bool
+	}{
+		{name: "trusted sdk-ts", entrypoint: "sdk-ts", want: true},
+		{name: "unknown entrypoint", entrypoint: "copied-client"},
+		{name: "missing beta", entrypoint: "sdk-ts", missingBeta: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			headers := confirmedClaudeCodeHeaders()
+			headers.Set("User-Agent", "claude-cli/9.9.9 (external, "+test.entrypoint+", agent-sdk/9.9.9)")
+			if test.missingBeta {
+				headers.Del("Anthropic-Beta")
+			}
+			detection := DetectClaudeCodeRequest(headers, claudeCodeDetectionPayload(validClaudeCodeMetadataUserID), false, cfg)
+			if detection.Confirmed != test.want {
+				t.Fatalf("Confirmed = %t, want %t", detection.Confirmed, test.want)
+			}
+		})
+	}
 }
