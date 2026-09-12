@@ -716,7 +716,7 @@ nonstream-keepalive-interval: 0
 # Other Anthropic-compatible upstreams still forward caller betas verbatim.
 #
 # Default headers for Claude API requests. Update only after measuring a new Claude Code release.
-# Unconfirmed clients use this CLI baseline. Verified native Claude Code CLI, sdk-cli,
+# Unconfirmed clients use this CLI baseline. Verified native Claude Code CLI, sdk-cli, sdk-ts,
 # and VSCode requests preserve their measured entrypoint when the Claude Code version is a
 # patch release in the configured major/minor line at or above this baseline. Older versions
 # and newer major/minor lines fall back to the baseline until measured. In legacy mode,
@@ -732,6 +732,7 @@ nonstream-keepalive-interval: 0
 #   arch: "arm64"
 #   timeout: "600"
 #   timezone: "Asia/Singapore"  # fallback IANA timezone for cloaked currentDate; a credential JSON "timezone" takes priority
+#   trust-client-version: false  # fork option for trusted callers: accept well-formed native UA versions beyond the baseline
 #   stabilize-device-profile: false  # optional, default false; set true to enable per-auth/API-key fingerprint pinning
 
 # Default headers for Codex OAuth model requests.
