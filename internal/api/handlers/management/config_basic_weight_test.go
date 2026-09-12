@@ -10,3 +10,12 @@ func TestNormalizeRoutingStrategyWeightedRoundRobin(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeRoutingStrategyEarliestReset(t *testing.T) {
+	for _, input := range []string{"earliest-reset", " EARLIEST-RESET "} {
+		got, ok := normalizeRoutingStrategy(input)
+		if !ok || got != "earliest-reset" {
+			t.Fatalf("normalizeRoutingStrategy(%q) = %q, %v", input, got, ok)
+		}
+	}
+}
