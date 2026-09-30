@@ -176,3 +176,28 @@ func TestManager_ResetQuotaClearsRuntimeAndRegistryState(t *testing.T) {
 		t.Fatalf("registry model count after reset = %d, want 1", count)
 	}
 }
+
+func TestClientModelProjectionCarriesCooldownExpiry(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	now := time.Date(2026, 9, 26, 0, 0, 0, 0, time.UTC)
+	until := now.Add(time.Minute)
+	auth := &Auth{ID: "expiry", Provider: "codex", ModelStates: map[string]*ModelState{"astra": {Status: StatusError, Unavailable: true, NextRetryAfter: until}}}
+	projection := manager.clientModelProjectionForAuth(auth, "astra", now)
+	if !projection.Suspended || !projection.SuspendUntil.Equal(until) {
+		t.Fatalf("active cooldown: %+v", projection)
+	}
+	projection = manager.clientModelProjectionForAuth(auth, "astra", until)
+	if projection.Suspended {
+		t.Fatalf("expired cooldown remains suspended: %+v", projection)
+	}
+	auth.Quota = QuotaState{Exceeded: true, Reason: "credential_quota", NextRecoverAt: until.Add(time.Hour)}
+	projection = manager.clientModelProjectionForAuth(auth, "astra", now)
+	if !projection.SuspendUntil.Equal(auth.Quota.NextRecoverAt) {
+		t.Fatalf("credential deadline lost: %+v", projection)
+	}
+	auth.Disabled = true
+	projection = manager.clientModelProjectionForAuth(auth, "astra", now)
+	if !projection.Suspended || !projection.SuspendUntil.IsZero() {
+		t.Fatalf("disabled account must not expire: %+v", projection)
+	}
+}
