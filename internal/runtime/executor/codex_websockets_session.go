@@ -722,16 +722,25 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			invalidate := func() {
 				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
 			}
-			invalidated := false
-			ch, done := sess.activeForConn(conn)
-			if ch != nil {
-				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
-				if sess.clearActive(conn, ch) {
-					close(ch)
+			consumerInvalidate := invalidate
+			if isCodexWebsocketMessageTooBigClose(errRead) {
+				// An oversized frame may be replayed over HTTP by the active consumer, which
+				// then publishes the disconnect only when it surfaces the rejection downstream.
+				consumerInvalidate = func() {
+					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "upstream_disconnected", errRead)
 				}
 			}
-			if !invalidated {
+			ch, done := sess.activeForConn(conn)
+			if ch == nil {
 				invalidate()
+				return
+			}
+			invalidated := sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, consumerInvalidate)
+			if sess.clearActive(conn, ch) {
+				close(ch)
+			}
+			if !invalidated {
+				consumerInvalidate()
 			}
 			return
 		}

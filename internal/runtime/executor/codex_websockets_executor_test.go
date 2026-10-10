@@ -1039,8 +1039,15 @@ func TestCodexWebsocketsExecuteStreamReplaysOverHTTPOnMessageTooBig(t *testing.T
 	defer server.Close()
 
 	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	auth := &cliproxyauth.Auth{ID: "auth-replay", Provider: "codex", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
 	req, opts := codexMessageTooBigRequest()
+	const sessionID = "sess-replay"
+	opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}
+	disconnectCh := exec.UpstreamDisconnectChan(sessionID)
+	if disconnectCh == nil {
+		t.Fatal("expected disconnect channel")
+	}
 
 	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 	result, err := exec.ExecuteStream(ctx, auth, req, opts)
@@ -1072,6 +1079,13 @@ func TestCodexWebsocketsExecuteStreamReplaysOverHTTPOnMessageTooBig(t *testing.T
 	if !strings.Contains(joined, "resp_http") || !strings.Contains(joined, "response.completed") {
 		t.Fatalf("replayed stream did not carry the HTTP completion, got %q", joined)
 	}
+	// The downstream handler closes the client socket on this signal, which would cut the
+	// replayed response short; a replay must therefore leave it unpublished.
+	select {
+	case disconnectErr := <-disconnectCh:
+		t.Fatalf("upstream disconnect published during HTTP replay: %v", disconnectErr)
+	case <-time.After(200 * time.Millisecond):
+	}
 }
 
 func TestCodexWebsocketsExecuteStreamMapsMessageTooBigCloseAfterPayload(t *testing.T) {
@@ -1081,8 +1095,15 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigCloseAfterPayload(t *testi
 	defer server.Close()
 
 	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	auth := &cliproxyauth.Auth{ID: "auth-after-payload", Provider: "codex", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
 	req, opts := codexMessageTooBigRequest()
+	const sessionID = "sess-after-payload"
+	opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}
+	disconnectCh := exec.UpstreamDisconnectChan(sessionID)
+	if disconnectCh == nil {
+		t.Fatal("expected disconnect channel")
+	}
 
 	result, err := exec.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, req, opts)
 	if err != nil {
@@ -1109,6 +1130,14 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigCloseAfterPayload(t *testi
 			assertCodexMessageTooBigChunk(t, chunk.Err)
 			if got := httpCalls.Load(); got != 0 {
 				t.Fatalf("HTTP replay calls = %d, want 0 after a payload was forwarded", got)
+			}
+			select {
+			case _, ok := <-disconnectCh:
+				if !ok {
+					t.Fatal("expected disconnect channel to deliver the 1009 before closing")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for the surfaced 1009 to publish the upstream disconnect")
 			}
 			return
 		case <-timeout:

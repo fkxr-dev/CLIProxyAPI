@@ -138,6 +138,28 @@ func codexWebsocketHTTPReplayAllowed(ctx context.Context, opts cliproxyexecutor.
 	return !cliproxyexecutor.RequiredUpstreamWebsocket(ctx)
 }
 
+// isCodexWebsocketMessageTooBigClose reports whether err carries an upstream 1009 close.
+func isCodexWebsocketMessageTooBigClose(err error) bool {
+	var closeErr *websocket.CloseError
+	return errors.As(err, &closeErr) && closeErr.Code == websocket.CloseMessageTooBig
+}
+
+// invalidateUpstreamConnForSendError releases conn after a failed send. When the failure will
+// be replayed over HTTP the downstream disconnect is not published, so the client keeps its
+// websocket while the replayed response streams back.
+func (e *CodexWebsocketsExecutor) invalidateUpstreamConnForSendError(ctx context.Context, opts cliproxyexecutor.Options, sess *codexWebsocketSession, conn *websocket.Conn, err error) {
+	if codexWebsocketHTTPReplayAllowed(ctx, opts, err) {
+		e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "send_error", err)
+		return
+	}
+	e.invalidateUpstreamConn(sess, conn, "send_error", err)
+	// The read loop leaves a 1009 unpublished for the consumer; surface it now that the
+	// rejection is being returned instead of replayed.
+	if disconnectErr := sess.upstreamDisconnectError(conn); isCodexWebsocketMessageTooBigClose(disconnectErr) {
+		sess.notifyUpstreamDisconnect(disconnectErr)
+	}
+}
+
 func logCodexWebsocketHTTPReplay(sessionID, authID string, payloadBytes int) {
 	log.Infof("codex websockets: upstream rejected request as too big; replaying over HTTP session=%s auth=%s bytes=%d", sessionID, authID, payloadBytes)
 }

@@ -206,7 +206,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				}
 				return resp, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 			}
-			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
+			e.invalidateUpstreamConnForSendError(ctx, opts, sess, conn, errSend)
 			if !shouldRetryCodexWebsocketSend(errSend) {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 				if codexWebsocketHTTPReplayAllowed(ctx, opts, errSend) {
@@ -251,7 +251,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					wsReqBody = wsReqBodyRetry
 				} else {
 					errSendRetry = mapCodexWebsocketWriteError(sess, connRetry, errSendRetry)
-					e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
+					e.invalidateUpstreamConnForSendError(ctx, opts, sess, connRetry, errSendRetry)
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 					if codexWebsocketHTTPReplayAllowed(ctx, opts, errSendRetry) {
 						logCodexWebsocketHTTPReplay(executionSessionID, authID, len(wsReqBodyRetry))
@@ -266,7 +266,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			}
 		} else {
 			if sess != nil {
-				e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
+				e.invalidateUpstreamConnForSendError(ctx, opts, sess, conn, errSend)
 				sess.clearActive(conn, readCh)
 				if isEphemeralSession {
 					closeCodexWebsocketSession(sess, "send_error")
@@ -300,6 +300,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				logCodexWebsocketHTTPReplay(executionSessionID, authID, len(wsReqBody))
 				return e.CodexExecutor.Execute(ctx, auth, req, opts)
 			}
+			sess.notifyUpstreamDisconnect(errRead)
 			return resp, mappedErr
 		}
 		if msgType != websocket.TextMessage {

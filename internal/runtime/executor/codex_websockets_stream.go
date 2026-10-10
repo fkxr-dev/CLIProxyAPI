@@ -166,7 +166,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 			}
-			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
+			e.invalidateUpstreamConnForSendError(ctx, opts, sess, conn, errSend)
 			if !shouldRetryCodexWebsocketSend(errSend) {
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
@@ -215,7 +215,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if errSendRetry := writeCodexWebsocketMessage(sess, conn, wsReqBodyRetry); errSendRetry != nil {
 				errSendRetry = mapCodexWebsocketWriteError(sess, conn, errSendRetry)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
-				e.invalidateUpstreamConn(sess, conn, "send_error", errSendRetry)
+				e.invalidateUpstreamConnForSendError(ctx, opts, sess, conn, errSendRetry)
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
 				if codexWebsocketHTTPReplayAllowed(ctx, opts, errSendRetry) {
@@ -227,7 +227,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			wsReqBody = wsReqBodyRetry
 		} else {
 			if sess != nil {
-				e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
+				e.invalidateUpstreamConnForSendError(ctx, opts, sess, conn, errSend)
 				sess.clearActive(conn, readCh)
 				if isEphemeralSession {
 					closeCodexWebsocketSession(sess, "send_error")
@@ -298,8 +298,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
 			if errRead != nil {
 				mappedErr := mapCodexWebsocketReadError(errRead)
+				replayOverHTTP := len(bufferedChunks) == 0 && codexWebsocketHTTPReplayAllowed(ctx, opts, mappedErr)
 				if sess != nil {
-					e.invalidateUpstreamConn(sess, conn, "read_error", mappedErr)
+					if replayOverHTTP {
+						e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "read_error", mappedErr)
+					} else {
+						e.invalidateUpstreamConn(sess, conn, "read_error", mappedErr)
+						sess.notifyUpstreamDisconnect(errRead)
+					}
 					sess.clearActive(conn, readCh)
 					unlockStreamSession()
 					if isEphemeralSession {
@@ -310,7 +316,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					_ = closer.Close()
 				}
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
-				if len(bufferedChunks) == 0 && codexWebsocketHTTPReplayAllowed(ctx, opts, mappedErr) {
+				if replayOverHTTP {
 					logCodexWebsocketHTTPReplay(executionSessionID, authID, len(wsReqBody))
 					return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 				}
@@ -621,6 +627,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				reporter.PublishFailure(ctx, mappedErr)
 				_ = send(cliproxyexecutor.StreamChunk{Err: mappedErr})
+				// The read loop leaves 1009 disconnects unpublished so a replay can keep the
+				// client socket; publish it here once the rejection reached the stream.
+				sess.notifyUpstreamDisconnect(errRead)
 				return
 			}
 			if msgType != websocket.TextMessage {
