@@ -170,6 +170,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if !shouldRetryCodexWebsocketSend(errSend) {
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
+				if codexWebsocketHTTPReplayAllowed(ctx, opts, errSend) {
+					logCodexWebsocketHTTPReplay(executionSessionID, authID, len(wsReqBody))
+					return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+				}
 				return nil, errSend
 			}
 
@@ -214,6 +218,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				e.invalidateUpstreamConn(sess, conn, "send_error", errSendRetry)
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
+				if codexWebsocketHTTPReplayAllowed(ctx, opts, errSendRetry) {
+					logCodexWebsocketHTTPReplay(executionSessionID, authID, len(wsReqBodyRetry))
+					return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+				}
 				return nil, errSendRetry
 			}
 			wsReqBody = wsReqBodyRetry
@@ -229,6 +237,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if closer != nil {
 					_ = closer.Close()
 				}
+			}
+			if codexWebsocketHTTPReplayAllowed(ctx, opts, errSend) {
+				logCodexWebsocketHTTPReplay(executionSessionID, authID, len(wsReqBody))
+				return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 			}
 			return nil, errSend
 		}
@@ -298,6 +310,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					_ = closer.Close()
 				}
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
+				if len(bufferedChunks) == 0 && codexWebsocketHTTPReplayAllowed(ctx, opts, mappedErr) {
+					logCodexWebsocketHTTPReplay(executionSessionID, authID, len(wsReqBody))
+					return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+				}
 				reporter.PublishFailure(ctx, mappedErr)
 				return nil, mappedErr
 			}
@@ -559,7 +575,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 		}()
 
+		// forwardedPayload records whether any response bytes reached the downstream channel.
+		// A transparent HTTP replay is only safe while nothing has been delivered yet.
+		forwardedPayload := chanCapacity > 0
 		send := func(chunk cliproxyexecutor.StreamChunk) bool {
+			if len(chunk.Payload) > 0 {
+				forwardedPayload = true
+			}
 			if ctx == nil {
 				out <- chunk
 				return true
@@ -591,6 +613,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				terminateReason = "read_error"
 				terminateErr = mappedErr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
+				if !forwardedPayload && codexWebsocketHTTPReplayAllowed(ctx, opts, mappedErr) {
+					terminateReason = "http_replay"
+					logCodexWebsocketHTTPReplay(executionSessionID, authID, len(wsReqBody))
+					e.replayCodexStreamOverHTTP(ctx, auth, req, opts, send)
+					return
+				}
 				reporter.PublishFailure(ctx, mappedErr)
 				_ = send(cliproxyexecutor.StreamChunk{Err: mappedErr})
 				return
@@ -830,4 +858,23 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 		optimizeMultiAgentV2: optimizeMultiAgentV2,
 		multiAgentV2Conflict: multiAgentV2Conflict,
 	}, nil
+}
+
+// replayCodexStreamOverHTTP re-executes req on the HTTP transport and forwards its chunks to
+// send. It is used when the upstream websocket rejected the request frame as too big before
+// any response bytes were delivered downstream.
+func (e *CodexWebsocketsExecutor) replayCodexStreamOverHTTP(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, send func(cliproxyexecutor.StreamChunk) bool) {
+	result, errReplay := e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+	if errReplay != nil {
+		_ = send(cliproxyexecutor.StreamChunk{Err: errReplay})
+		return
+	}
+	if result == nil || result.Chunks == nil {
+		return
+	}
+	for chunk := range result.Chunks {
+		if !send(chunk) {
+			return
+		}
+	}
 }

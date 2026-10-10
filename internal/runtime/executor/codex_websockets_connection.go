@@ -123,6 +123,25 @@ func mapCodexWebsocketReadError(err error) error {
 	return err
 }
 
+// codexWebsocketHTTPReplayAllowed reports whether a request the upstream websocket rejected as
+// too big may be replayed transparently over the HTTP transport. Incremental requests that
+// depend on upstream websocket state and Home-bound execution lifecycles keep the websocket-only
+// path and surface the rejection to the client instead.
+func codexWebsocketHTTPReplayAllowed(ctx context.Context, opts cliproxyexecutor.Options, err error) bool {
+	var tooBig codexWebsocketMessageTooBigError
+	if !errors.As(err, &tooBig) {
+		return false
+	}
+	if opts.ExecutionLifecycle != nil {
+		return false
+	}
+	return !cliproxyexecutor.RequiredUpstreamWebsocket(ctx)
+}
+
+func logCodexWebsocketHTTPReplay(sessionID, authID string, payloadBytes int) {
+	log.Infof("codex websockets: upstream rejected request as too big; replaying over HTTP session=%s auth=%s bytes=%d", sessionID, authID, payloadBytes)
+}
+
 func normalizeCodexWebsocketParallelToolCalls(body []byte, headers http.Header) []byte {
 	if !util.IsCodexResponsesLiteRequest(body, headers) {
 		return body

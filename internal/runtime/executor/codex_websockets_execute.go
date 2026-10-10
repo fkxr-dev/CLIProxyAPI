@@ -209,6 +209,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 			if !shouldRetryCodexWebsocketSend(errSend) {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
+				if codexWebsocketHTTPReplayAllowed(ctx, opts, errSend) {
+					logCodexWebsocketHTTPReplay(executionSessionID, authID, len(wsReqBody))
+					return e.CodexExecutor.Execute(ctx, auth, req, opts)
+				}
 				return resp, errSend
 			}
 
@@ -249,6 +253,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					errSendRetry = mapCodexWebsocketWriteError(sess, connRetry, errSendRetry)
 					e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
+					if codexWebsocketHTTPReplayAllowed(ctx, opts, errSendRetry) {
+						logCodexWebsocketHTTPReplay(executionSessionID, authID, len(wsReqBodyRetry))
+						return e.CodexExecutor.Execute(ctx, auth, req, opts)
+					}
 					return resp, errSendRetry
 				}
 			} else {
@@ -265,6 +273,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				}
 			}
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
+			if codexWebsocketHTTPReplayAllowed(ctx, opts, errSend) {
+				logCodexWebsocketHTTPReplay(executionSessionID, authID, len(wsReqBody))
+				return e.CodexExecutor.Execute(ctx, auth, req, opts)
+			}
 			return resp, errSend
 		}
 	}
@@ -284,6 +296,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if errRead != nil {
 			mappedErr := mapCodexWebsocketReadError(errRead)
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
+			if len(outputItemsByIndex) == 0 && len(outputItemsFallback) == 0 && !sawOutputDelta && codexWebsocketHTTPReplayAllowed(ctx, opts, mappedErr) {
+				logCodexWebsocketHTTPReplay(executionSessionID, authID, len(wsReqBody))
+				return e.CodexExecutor.Execute(ctx, auth, req, opts)
+			}
 			return resp, mappedErr
 		}
 		if msgType != websocket.TextMessage {

@@ -958,9 +958,22 @@ func TestMapCodexWebsocketWriteErrorDoesNotReusePriorConnectionClose(t *testing.
 	}
 }
 
-func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
+// newCodexMessageTooBigServer serves a websocket upgrade on GET that reads one frame and then
+// closes with 1009, and an SSE completion on POST. preludeEvent, when set, is written as a text
+// frame before the close so the executor has already forwarded a payload downstream.
+func newCodexMessageTooBigServer(t *testing.T, preludeEvent string, httpCalls *atomic.Int32) *httptest.Server {
+	t.Helper()
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			httpCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("event: response.created\n"))
+			_, _ = w.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_http","model":"gpt-5-codex"}}` + "\n\n"))
+			_, _ = w.Write([]byte("event: response.completed\n"))
+			_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_http","status":"completed","output":[]}}` + "\n\n"))
+			return
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			t.Errorf("upgrade websocket: %v", err)
@@ -972,6 +985,12 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 			t.Errorf("read upstream websocket message: %v", errRead)
 			return
 		}
+		if preludeEvent != "" {
+			if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(preludeEvent)); errWrite != nil {
+				t.Errorf("write prelude websocket message: %v", errWrite)
+				return
+			}
+		}
 		deadline := time.Now().Add(time.Second)
 		closeMessage := websocket.FormatCloseMessage(websocket.CloseMessageTooBig, "message too big")
 		if errWrite := conn.WriteControl(websocket.CloseMessage, closeMessage, deadline); errWrite != nil {
@@ -979,10 +998,9 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 			return
 		}
 	}))
-	defer server.Close()
+}
 
-	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+func codexMessageTooBigRequest() (cliproxyexecutor.Request, cliproxyexecutor.Options) {
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5-codex",
 		Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`),
@@ -991,36 +1009,140 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 		SourceFormat:   sdktranslator.FromString("openai-response"),
 		ResponseFormat: sdktranslator.FromString("openai-response"),
 	}
+	return req, opts
+}
 
-	result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+func assertCodexMessageTooBigChunk(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("error = nil, want message-too-big error")
+	}
+	statusErr, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("error type %T does not expose StatusCode", err)
+	}
+	if got := statusErr.StatusCode(); got != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", got, http.StatusRequestEntityTooLarge)
+	}
+	if got := gjson.Get(err.Error(), "error.code").String(); got != "message_too_big" {
+		t.Fatalf("error code = %q, want message_too_big; err=%v", got, err)
+	}
+	requestErr, ok := err.(interface{ IsRequestScoped() bool })
+	if !ok || !requestErr.IsRequestScoped() {
+		t.Fatalf("message-too-big error should be request scoped, got %T", err)
+	}
+}
+
+func TestCodexWebsocketsExecuteStreamReplaysOverHTTPOnMessageTooBig(t *testing.T) {
+	var httpCalls atomic.Int32
+	server := newCodexMessageTooBigServer(t, "", &httpCalls)
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req, opts := codexMessageTooBigRequest()
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	result, err := exec.ExecuteStream(ctx, auth, req, opts)
 	if err != nil {
 		t.Fatalf("ExecuteStream() error = %v", err)
 	}
 
-	select {
-	case chunk, ok := <-result.Chunks:
-		if !ok {
-			t.Fatal("stream closed before error chunk")
+	var payloads []string
+	timeout := time.After(5 * time.Second)
+	for done := false; !done; {
+		select {
+		case chunk, ok := <-result.Chunks:
+			if !ok {
+				done = true
+				continue
+			}
+			if chunk.Err != nil {
+				t.Fatalf("unexpected error chunk after HTTP replay: %v", chunk.Err)
+			}
+			payloads = append(payloads, string(chunk.Payload))
+		case <-timeout:
+			t.Fatal("timed out waiting for replayed stream to finish")
 		}
-		if chunk.Err == nil {
-			t.Fatal("error chunk Err = nil, want message-too-big error")
+	}
+	if got := httpCalls.Load(); got != 1 {
+		t.Fatalf("HTTP replay calls = %d, want 1", got)
+	}
+	joined := strings.Join(payloads, "")
+	if !strings.Contains(joined, "resp_http") || !strings.Contains(joined, "response.completed") {
+		t.Fatalf("replayed stream did not carry the HTTP completion, got %q", joined)
+	}
+}
+
+func TestCodexWebsocketsExecuteStreamMapsMessageTooBigCloseAfterPayload(t *testing.T) {
+	var httpCalls atomic.Int32
+	prelude := `{"type":"response.created","response":{"id":"resp_ws","model":"gpt-5-codex"}}`
+	server := newCodexMessageTooBigServer(t, prelude, &httpCalls)
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req, opts := codexMessageTooBigRequest()
+
+	result, err := exec.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, req, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	sawPayload := false
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case chunk, ok := <-result.Chunks:
+			if !ok {
+				t.Fatal("stream closed before error chunk")
+			}
+			if chunk.Err == nil {
+				if len(chunk.Payload) > 0 {
+					sawPayload = true
+				}
+				continue
+			}
+			if !sawPayload {
+				t.Fatal("expected the websocket prelude payload before the error chunk")
+			}
+			assertCodexMessageTooBigChunk(t, chunk.Err)
+			if got := httpCalls.Load(); got != 0 {
+				t.Fatalf("HTTP replay calls = %d, want 0 after a payload was forwarded", got)
+			}
+			return
+		case <-timeout:
+			t.Fatal("timed out waiting for error stream chunk")
 		}
-		statusErr, ok := chunk.Err.(interface{ StatusCode() int })
-		if !ok {
-			t.Fatalf("error type %T does not expose StatusCode", chunk.Err)
+	}
+}
+
+func TestCodexWebsocketsExecuteStreamKeepsMessageTooBigWithLifecycle(t *testing.T) {
+	var httpCalls atomic.Int32
+	server := newCodexMessageTooBigServer(t, "", &httpCalls)
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-lifecycle", Provider: "codex", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req, opts := codexMessageTooBigRequest()
+	opts.ExecutionLifecycle = newTerminalFailureLifecycle()
+
+	result, err := exec.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, req, opts)
+	if err != nil {
+		assertCodexMessageTooBigChunk(t, err)
+	} else {
+		select {
+		case chunk, ok := <-result.Chunks:
+			if !ok {
+				t.Fatal("stream closed before error chunk")
+			}
+			assertCodexMessageTooBigChunk(t, chunk.Err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for error stream chunk")
 		}
-		if got := statusErr.StatusCode(); got != http.StatusRequestEntityTooLarge {
-			t.Fatalf("status = %d, want %d", got, http.StatusRequestEntityTooLarge)
-		}
-		if got := gjson.Get(chunk.Err.Error(), "error.code").String(); got != "message_too_big" {
-			t.Fatalf("error code = %q, want message_too_big; err=%v", got, chunk.Err)
-		}
-		requestErr, ok := chunk.Err.(interface{ IsRequestScoped() bool })
-		if !ok || !requestErr.IsRequestScoped() {
-			t.Fatalf("message-too-big error should be request scoped, got %T", chunk.Err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for error stream chunk")
+	}
+	if got := httpCalls.Load(); got != 0 {
+		t.Fatalf("HTTP replay calls = %d, want 0 with an execution lifecycle", got)
 	}
 }
 
